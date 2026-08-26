@@ -1,15 +1,24 @@
-"""Core load function wrapping datasets.load_dataset with video support."""
+"""The entry point most users touch: :func:`load`.
+
+``load`` is a thin wrapper around ``datasets.load_dataset`` that knows where the
+video files are. It stays thin on purpose --- anything you can do with a
+``datasets.Dataset`` you can still do with what comes back, because what comes
+back *is* one.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from datasets import Dataset, DatasetDict, load_dataset
 
+from ._configs import NON_SEGMENT_CONFIGS
 from ._constants import HF_REPO_ID
-from ._video import add_video
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ._video_dataset import OmniFallVideoDataset
 
 
 def load(
@@ -17,60 +26,66 @@ def load(
     split: str | None = None,
     *,
     video: bool = False,
-    syn_video_dir: str | Path | None = None,
-    oops_video_dir: str | Path | None = None,
-    download_syn: bool = True,
+    video_dirs: Mapping[str, str | Path] | None = None,
+    check: bool = True,
+    strict: bool = False,
+    download: bool = False,
     consent: bool = False,
     **kwargs: Any,
 ) -> Dataset | DatasetDict:
-    """Load an OmniFall dataset config, optionally with video file paths.
-
-    This is the primary entry point for loading OmniFall data. It wraps
-    ``datasets.load_dataset()`` and optionally adds a ``video`` column
-    containing absolute file paths to the video files.
-
-    When the ``OMNIFALL_ROOT`` environment variable is set, video paths are
-    resolved locally as ``{OMNIFALL_ROOT}/{dataset}/video/{path}.mp4`` and
-    no downloads are performed.
+    """Load an OmniFall config, optionally resolving video file paths.
 
     Args:
-        config: Dataset config name (e.g., "of-syn", "of-itw", "of-sta-cs").
-            Defaults to "labels" (all staged + OOPS labels).
-        split: Optional split name ("train", "validation", "test").
-            If None, returns a DatasetDict with all available splits.
-        video: If True, add a ``video`` column with absolute file paths.
-            OF-Syn videos are auto-downloaded; OOPS videos are auto-prepared
-            with an interactive license consent prompt (skip with ``consent=True``).
-            With ``OMNIFALL_ROOT``, all datasets are supported without downloads.
-        syn_video_dir: Custom directory for OF-Syn videos.
-            Ignored when ``OMNIFALL_ROOT`` is set.
-        oops_video_dir: Custom directory for OOPS videos.
-            Ignored when ``OMNIFALL_ROOT`` is set.
-        download_syn: If True (default), auto-download OF-Syn videos.
-            Ignored when ``OMNIFALL_ROOT`` is set.
-        consent: If True, skip the interactive OOPS license consent prompt
-            during auto-preparation.
-        **kwargs: Additional keyword arguments passed to
-            ``datasets.load_dataset()``.
+        config: Any config served by the Hub repository, e.g. ``"of-syn"``,
+            ``"of-itw"``, ``"cs"``, ``"le2i-cv"``. Run ``omnifall configs`` or
+            :func:`omnifall.list_configs` for the current list.
+        split: ``"train"``, ``"validation"``, ``"test"``, or ``None`` for a
+            ``DatasetDict`` holding every split the config defines.
+        video: Add a ``video`` column of absolute file paths.
+        video_dirs: Per-dataset overrides, ``{"le2i": "/data/le2i/video"}``.
+            Each value is the directory that ``path`` values are relative to.
+        check: Stat each file and set ``None`` where it is absent. Turning this
+            off is faster but you will only find out about a missing file when
+            the dataloader tries to decode it.
+        strict: Raise :class:`~omnifall.MissingVideosError` instead of warning
+            when any referenced video is absent.
+        download: Obtain missing component datasets before resolving. Only some
+            components can be fetched automatically; see ``omnifall sources``.
+        consent: Accept the OOPS license prompt non-interactively. Only
+            meaningful together with ``download``.
+        **kwargs: Forwarded to ``datasets.load_dataset``.
 
     Returns:
-        A Dataset (if split specified) or DatasetDict.
+        A ``Dataset`` when *split* is given, otherwise a ``DatasetDict``.
+
+    Raises:
+        ValueError: If *video* is requested for a config that has no per-segment
+            video counterpart (``metadata-syn``, ``framewise-syn``).
 
     Examples:
         >>> import omnifall
-        >>> ds = omnifall.load("of-syn")
-        >>> ds = omnifall.load("of-syn", video=True)
+        >>> ds = omnifall.load("le2i-cs")                       # annotations only
         >>> ds = omnifall.load("of-itw", split="test", video=True)
     """
+    if video and config in NON_SEGMENT_CONFIGS:
+        raise ValueError(
+            f"Config {config!r} is not a per-segment table, so there is nothing "
+            f"to attach video paths to. Configs without video: "
+            f"{sorted(NON_SEGMENT_CONFIGS)}."
+        )
+
     ds = load_dataset(HF_REPO_ID, config, split=split, **kwargs)
 
     if video:
+        from ._video import add_video
+
         ds = add_video(
             ds,
             config,
-            syn_video_dir=syn_video_dir,
-            oops_video_dir=oops_video_dir,
-            download_syn=download_syn,
+            video_dirs=video_dirs,
+            check=check,
+            strict=strict,
+            download=download,
             consent=consent,
         )
 
@@ -81,56 +96,104 @@ def load_video_dataset(
     config: str,
     split: str | None = None,
     *,
-    target_fps: float = 15.0,
     num_frames: int = 16,
-    transform: Callable | None = None,
-    fast: bool = True,
+    target_fps: float = 15.0,
+    sampling: str | Mapping[str, str] = "auto",
+    transform: Callable | Mapping[str, Callable] | None = None,
+    output_format: str = "TCHW",
+    seed: int | None = None,
+    on_error: str = "raise",
     **kwargs: Any,
 ) -> "OmniFallVideoDataset | dict[str, OmniFallVideoDataset]":
-    """Load OmniFall as a PyTorch video dataset ready for ``DataLoader``.
+    """Load OmniFall as PyTorch dataset(s) that decode video on demand.
 
-    Convenience function combining ``load(config, video=True)`` with
-    ``OmniFallVideoDataset`` construction.
+    Combines ``load(config, video=True)`` with
+    :class:`~omnifall.OmniFallVideoDataset`.
 
     Args:
-        config: Dataset config name (e.g., ``"cmdfall-cs"``, ``"of-syn"``).
-        split: Optional split name. If None, returns a dict mapping split
-            names to ``OmniFallVideoDataset`` instances.
-        target_fps: Target FPS for frame sampling.
-        num_frames: Number of frames per segment.
-        transform: Optional transform callable.
-        fast: Use fast PTS-based video loading.
-        **kwargs: Passed through to ``omnifall.load()`` (e.g.,
-            ``syn_video_dir``, ``consent``).
+        config: Config name.
+        split: Split name, or ``None`` for a dict of all splits.
+        num_frames: Frames per clip.
+        target_fps: Sampling rate used to lay out those frames in time.
+        sampling: ``"random"``, ``"uniform"``, ``"center"``, or ``"auto"``
+            (the default) which uses ``"random"`` for the train split and
+            ``"uniform"`` everywhere else --- the usual choice, and the one that
+            keeps evaluation reproducible. May also be a per-split mapping.
+        transform: A callable, or a per-split mapping of them. See
+            :class:`~omnifall.VideoTransform`.
+        output_format: ``"TCHW"`` for HuggingFace ``transformers`` (the
+            default), ``"CTHW"`` for the channels-first video convention, or
+            ``"THWC"`` for raw uint8 frames.
+        seed: Base seed for ``sampling="random"``. Given a seed, sampling is
+            reproducible across processes and epochs.
+        on_error: ``"raise"`` (default), ``"skip"`` or ``"retry"``.
+        **kwargs: Forwarded to :func:`load` (``video_dirs``, ``download``, ...).
 
     Returns:
-        An ``OmniFallVideoDataset`` (if *split* given) or a dict of them.
+        One ``OmniFallVideoDataset`` when *split* is given, otherwise a dict
+        keyed by split name.
 
-    Example::
-
-        datasets = omnifall.load_video_dataset("cmdfall-cs", target_fps=15, num_frames=16)
-        train_ds = datasets["train"]
-        loader = DataLoader(train_ds, batch_size=4, collate_fn=omnifall.collate_fn)
+    Example:
+        >>> import omnifall
+        >>> from torch.utils.data import DataLoader
+        >>> parts = omnifall.load_video_dataset("le2i-cs", num_frames=16)
+        >>> loader = DataLoader(parts["train"], batch_size=4,
+        ...                     collate_fn=omnifall.collate_fn)
     """
     from ._video_dataset import OmniFallVideoDataset
 
     ds = load(config, split=split, video=True, **kwargs)
 
+    def _for(name: str | None, part: Dataset) -> "OmniFallVideoDataset":
+        return OmniFallVideoDataset(
+            part,
+            num_frames=num_frames,
+            target_fps=target_fps,
+            sampling=_pick(sampling, name),
+            transform=_pick(transform, name),
+            output_format=output_format,
+            seed=seed,
+            on_error=on_error,
+        )
+
     if isinstance(ds, DatasetDict):
-        return {
-            name: OmniFallVideoDataset(
-                split_ds,
-                target_fps=target_fps,
-                num_frames=num_frames,
-                transform=transform,
-                fast=fast,
+        return {name: _for(name, part) for name, part in ds.items()}
+    return _for(split, ds)
+
+
+def _pick(value: Any, split: str | None) -> Any:
+    """Resolve a possibly per-split option for *split*.
+
+    ``"auto"`` becomes ``"random"`` on the train split and ``"uniform"``
+    elsewhere, which is what makes evaluation reproducible by default.
+    """
+    if isinstance(value, Mapping):
+        if split is None:
+            raise ValueError(
+                "A per-split mapping was given but the split is unknown. "
+                "Pass an explicit split= or a single value."
             )
-            for name, split_ds in ds.items()
-        }
-    return OmniFallVideoDataset(
-        ds,
-        target_fps=target_fps,
-        num_frames=num_frames,
-        transform=transform,
-        fast=fast,
-    )
+        if split not in value:
+            raise KeyError(
+                f"No entry for split {split!r} in {sorted(value)}. "
+                "Provide one for every split, or pass a single value."
+            )
+        return value[split]
+    if value == "auto":
+        return "random" if _is_train_split(split) else "uniform"
+    return value
+
+
+def _is_train_split(split: str | None) -> bool:
+    """Whether *split* names the training split.
+
+    ``datasets`` accepts slicing and arithmetic in split names, so the train
+    split can arrive as ``"train[:80%]"`` or ``"train[:100]+train[-100:]"``. A
+    bare ``== "train"`` silently turned those into deterministic sampling, which
+    is the opposite of what ``"auto"`` promises and costs augmentation diversity
+    without any error.
+    """
+    if not split:
+        return False
+    head = split.split("[", 1)[0].split("+", 1)[0].strip()
+    return head == "train"

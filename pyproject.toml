@@ -4,21 +4,32 @@ build-backend = "hatchling.build"
 
 [project]
 name = "omnifall"
-version = "0.1.0"
+version = "0.2.0"
 description = "Companion package for the OmniFall fall detection dataset"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 readme = "README.md"
 authors = [
     { name = "David Schneider", email = "david.schneider@kit.edu" },
 ]
-keywords = ["fall-detection", "dataset", "huggingface", "activity-recognition"]
+keywords = [
+    "fall-detection",
+    "dataset",
+    "huggingface",
+    "activity-recognition",
+    "video-understanding",
+]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
 ]
 dependencies = [
     "datasets>=3.0.0",
@@ -31,15 +42,56 @@ video = [
     "av>=10.0.0",
     "numpy",
     "torchvision",
+]
+transformers = [
+    "omnifall[video]",
     "transformers>=4.30.0",
+]
+dev = [
+    "nbformat",
+    "nbclient",
+    "ipykernel",
+    "matplotlib",
+    "omnifall[transformers]",
+    "pytest>=7.0",
+    "pytest-xdist",
+]
+all = [
+    "omnifall[dev]",
 ]
 
 [project.urls]
 Homepage = "https://huggingface.co/datasets/simplexsigil2/omnifall"
-Repository = "https://github.com/simplexsigil/omnifall"
+# Repository = "https://github.com/<owner>/<repo>"  # set once the code repo exists.
+# Note: github.com/simplexsigil/omnifall is the project *website*
+# (index.html + static/), not a code repository.
+Paper = "https://arxiv.org/abs/2505.19889"
+"Project Page" = "https://simplexsigil.github.io/omnifall/"
 
 [project.scripts]
 omnifall = "omnifall.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/omnifall"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "network: needs the HuggingFace Hub",
+    "localdata: needs real video files (OMNIFALL_ROOT)",
+    "slow: takes more than a few seconds",
+]
+filterwarnings = [
+    "error::DeprecationWarning:omnifall.*",
+]
+
+[tool.black]
+line-length = 88
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["E501"]

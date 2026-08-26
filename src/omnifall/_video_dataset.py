@@ -1,351 +1,656 @@
-"""PyTorch video dataset wrapping HuggingFace Dataset from ``omnifall.load()``.
+"""PyTorch video datasets over an OmniFall HuggingFace ``Dataset``.
 
-Provides ``OmniFallVideoDataset`` for single-dataset loading and
-``MultiOmniFallDataset`` for combining multiple datasets with proper indexing.
+Each row of an OmniFall dataset is one **temporal segment** of a video file
+(``path``, ``label``, ``start``, ``end``, ``subject``, ``cam``, ``dataset``),
+plus a ``video`` column with the absolute file path added by
+:func:`omnifall.add_video`. Many segments share the same file.
 
-Video decoding uses PyAV (``av`` package).
+:class:`OmniFallVideoDataset` decodes one segment per item;
+:class:`MultiOmniFallDataset` concatenates several of them while keeping track
+of which domain each item came from.
+
+Requires the optional ``torch``, ``av`` and ``numpy`` dependencies. This module
+is imported lazily by :mod:`omnifall`, never at package import time.
 """
 
 from __future__ import annotations
 
-import bisect
+import inspect
 import logging
-import math
-import random
+import warnings
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
-import av
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from ._decode import SAMPLING_STRATEGIES, VideoDecodeError, decode_segment, probe
+from ._label_maps import IDX2LABEL
+
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "ERROR_POLICIES",
+    "OUTPUT_FORMATS",
+    "VideoUnavailableError",
+    "MultiOmniFallDataset",
+    "OmniFallVideoDataset",
+]
+
+#: Per-sample layouts ``OmniFallVideoDataset`` can emit.
+OUTPUT_FORMATS = ("TCHW", "CTHW", "THWC")
+
+#: Accepted values of the ``on_error`` argument.
+ERROR_POLICIES = ("raise", "skip", "retry")
+
+OutputFormat = Literal["TCHW", "CTHW", "THWC"]
+ErrorPolicy = Literal["raise", "skip", "retry"]
+
+
+class VideoUnavailableError(FileNotFoundError):
+    """Raised when a row has no video file at all (``video`` column is ``None``).
+
+    This is a data-preparation problem, not a transient decoding failure, so it
+    is raised regardless of the ``on_error`` policy: silently skipping rows
+    whose media was never downloaded would misreport the size of an evaluation.
+    """
+
+
+def _infer_layout(shape: tuple[int, ...]) -> str | None:
+    """Infer the layout of a 4D clip tensor from its shape.
+
+    Args:
+        shape: The tensor shape.
+
+    Returns:
+        ``"TCHW"``, ``"CTHW"``, ``"THWC"``, or ``None`` when more than one
+        layout is consistent with *shape* (which happens for a 3-frame clip,
+        where ``(3, 3, H, W)`` is genuinely ambiguous).
+    """
+    if len(shape) != 4:
+        return None
+    candidates = set()
+    if shape[0] == 3:
+        candidates.add("CTHW")
+    if shape[1] == 3:
+        candidates.add("TCHW")
+    if shape[3] == 3:
+        candidates.add("THWC")
+    if len(candidates) == 1:
+        return candidates.pop()
+    return None
+
+
+_PERMUTATIONS: dict[tuple[str, str], tuple[int, ...]] = {
+    ("THWC", "TCHW"): (0, 3, 1, 2),
+    ("THWC", "CTHW"): (3, 0, 1, 2),
+    ("TCHW", "CTHW"): (1, 0, 2, 3),
+    ("TCHW", "THWC"): (0, 2, 3, 1),
+    ("CTHW", "TCHW"): (1, 0, 2, 3),
+    ("CTHW", "THWC"): (1, 2, 3, 0),
+}
+
+
+def _convert_layout(clip: torch.Tensor, src: str, dst: str) -> torch.Tensor:
+    """Permute *clip* from layout *src* to layout *dst*."""
+    if src == dst:
+        return clip
+    try:
+        perm = _PERMUTATIONS[(src, dst)]
+    except KeyError as exc:  # pragma: no cover - guarded by validation
+        raise ValueError(f"Cannot convert layout {src!r} -> {dst!r}.") from exc
+    return clip.permute(*perm).contiguous()
 
 
 class OmniFallVideoDataset(Dataset):
-    """PyTorch dataset that decodes video segments from an OmniFall HF Dataset.
-
-    Each row in the underlying HF Dataset represents one temporal segment
-    (with ``path``, ``label``, ``start``, ``end``, and a ``video`` column
-    containing the absolute file path). This class handles video decoding
-    via PyAV and temporal segment sampling.
+    """Decode OmniFall video segments into model-ready tensors.
 
     Args:
-        hf_dataset: A ``datasets.Dataset`` from ``omnifall.load(config, video=True)``.
-            Must contain columns: ``video``, ``label``, ``start``, ``end``.
-        target_fps: Target FPS for frame sampling.
-        num_frames: Number of frames to extract per segment.
-        transform: Optional callable ``(frames: list[np.ndarray]) -> dict``.
-            If provided, must return a dict with at least ``"pixel_values"``.
-            If None, returns raw frames as ``np.ndarray[T, H, W, C]``.
-        max_retries: Max retries on video decode errors before raising.
-        fast: Use PTS-based seeking (fast) or sequential decode (slow).
-        dataset_name: Name for this dataset (used by ``MultiOmniFallDataset``).
+        hf_dataset: A ``datasets.Dataset`` from
+            ``omnifall.load(config, video=True)``. Must have the columns
+            ``video``, ``label``, ``start`` and ``end``.
+        num_frames: Number of frames per segment.
+        target_fps: Sampling rate of the extracted clip, in frames per second.
+            Used by ``sampling="center"`` and ``"random"``; ignored by
+            ``"uniform"``.
+        sampling: Temporal sampling strategy. ``"uniform"`` (default) spreads
+            the frames evenly over the whole annotated segment and is
+            deterministic -- the right choice for validation and test.
+            ``"center"`` takes a deterministic ``(num_frames - 1) / target_fps``
+            second window from the middle of the segment. ``"random"`` takes the
+            same window at a random offset and is the right choice for training.
+        transform: Optional callable applied to the decoded
+            ``(T, H, W, 3)`` uint8 clip. May return a tensor or a dict
+            containing ``"pixel_values"``. If it exposes an ``output_format``
+            attribute (as the transforms in this package do), that attribute
+            decides the layout it produced; otherwise the layout is inferred
+            from the tensor shape, and if that is ambiguous the tensor is
+            assumed to already be in *output_format*. A transform whose
+            ``__call__`` accepts an ``rng`` keyword is handed this dataset's
+            per-item generator, which makes its augmentations reproducible too.
+        seed: Base seed for ``sampling="random"`` and for random transforms.
+            With a seed, item *i* always gets the same clip, in any process and
+            with any number of workers. With ``None``, the per-item generator is
+            seeded from torch's global RNG, which ``DataLoader`` reseeds per
+            worker and per epoch.
+        on_error: What to do when a segment cannot be decoded.
+            ``"raise"`` (default) propagates the
+            :class:`~omnifall._decode.VideoDecodeError`. ``"skip"`` returns a
+            sample with ``pixel_values=None`` and an ``error`` string for
+            :func:`omnifall.collate_fn` to drop -- **this silently shrinks
+            batches and changes epoch statistics, so only use it for
+            exploratory work.** ``"retry"`` is the omnifall 0.1.0 behaviour of
+            substituting a random other index; every substitution is logged at
+            WARNING level naming both indices.
+        max_retries: Number of substitutions ``on_error="retry"`` may make
+            before giving up and raising.
+        output_format: Layout of ``pixel_values``. ``"TCHW"`` (default) gives
+            ``(T, C, H, W)`` per sample and ``(B, T, C, H, W)`` per batch, which
+            is what both HuggingFace video models and ``fall-da`` expect.
+            ``"CTHW"`` gives ``(C, T, H, W)`` / ``(B, C, T, H, W)``, the
+            pytorchvideo convention. ``"THWC"`` returns the raw uint8 clip and
+            requires ``transform=None``.
+        return_meta: Whether to include the passthrough metadata columns in the
+            returned dict.
+        dataset_name: Name for this dataset. Defaults to the values of the
+            ``dataset`` column, joined with ``+``.
+        fast: Deprecated and ignored; decoding always seeks. Accepted only so
+            that ``omnifall.load_video_dataset(..., fast=...)`` keeps working.
+
+    Raises:
+        ValueError: For missing columns or invalid arguments.
+
+    Example::
+
+        train = OmniFallVideoDataset(
+            hf_train, sampling="random", seed=0,
+            transform=VideoTransform("train"),
+        )
+        val = OmniFallVideoDataset(hf_val, sampling="uniform",
+                                   transform=VideoTransform("val"))
     """
 
     def __init__(
         self,
         hf_dataset: Any,
-        target_fps: float = 15.0,
+        *,
         num_frames: int = 16,
-        transform: Callable | None = None,
+        target_fps: float = 15.0,
+        sampling: str = "uniform",
+        transform: Callable[..., Any] | None = None,
+        seed: int | None = None,
+        on_error: ErrorPolicy = "raise",
         max_retries: int = 10,
-        fast: bool = True,
+        output_format: OutputFormat = "TCHW",
+        return_meta: bool = True,
         dataset_name: str | None = None,
+        fast: bool | None = None,
     ) -> None:
         required = {"video", "label", "start", "end"}
         missing = required - set(hf_dataset.column_names)
         if missing:
             raise ValueError(
-                f"HF dataset is missing required columns: {missing}. "
+                f"HF dataset is missing required columns: {sorted(missing)}. "
                 "Did you pass video=True to omnifall.load()?"
+            )
+        if sampling not in SAMPLING_STRATEGIES:
+            raise ValueError(
+                f"sampling must be one of {SAMPLING_STRATEGIES}, got {sampling!r}."
+            )
+        if on_error not in ERROR_POLICIES:
+            raise ValueError(
+                f"on_error must be one of {ERROR_POLICIES}, got {on_error!r}."
+            )
+        if output_format not in OUTPUT_FORMATS:
+            raise ValueError(
+                f"output_format must be one of {OUTPUT_FORMATS}, got {output_format!r}."
+            )
+        if output_format == "THWC" and transform is not None:
+            raise ValueError(
+                "output_format='THWC' returns the raw decoded clip and cannot be "
+                "combined with a transform. Use 'TCHW' or 'CTHW', or drop the "
+                "transform."
+            )
+        if num_frames < 1:
+            raise ValueError(f"num_frames must be >= 1, got {num_frames}.")
+        if max_retries < 1:
+            raise ValueError(f"max_retries must be >= 1, got {max_retries}.")
+        if fast is not None:
+            warnings.warn(
+                "OmniFallVideoDataset(fast=...) is deprecated and ignored: "
+                "decoding always seeks to the segment and falls back to a "
+                "sequential scan of the same file only when seeking yields "
+                "nothing.",
+                DeprecationWarning,
+                stacklevel=2,
             )
 
         self.dataset = hf_dataset
-        self.target_fps = target_fps
         self.num_frames = num_frames
-        self.transform = transform
+        self.target_fps = target_fps
+        self.sampling = sampling
+        self.seed = seed
+        self.on_error = on_error
         self.max_retries = max_retries
-        self._use_fast = fast
+        self._output_format = output_format
+        self.return_meta = return_meta
 
-        # Derive dataset_name from the 'dataset' column if available
         if dataset_name is not None:
             self.dataset_name = dataset_name
         elif "dataset" in hf_dataset.column_names:
-            names = set(hf_dataset.unique("dataset"))
-            self.dataset_name = "+".join(sorted(names))
+            self.dataset_name = "+".join(sorted(set(hf_dataset.unique("dataset"))))
         else:
             self.dataset_name = "unknown"
 
-        # Cache column names for metadata passthrough
-        self._meta_columns = [
-            c
-            for c in hf_dataset.column_names
-            if c not in ("video", "label", "start", "end")
-        ]
+        self._meta_columns = [c for c in hf_dataset.column_names if c != "video"]
+        self._warned_ambiguous_layout = False
+        self.transform = transform
+
+    @property
+    def transform(self) -> Callable | None:
+        """The per-clip transform, or ``None`` for raw frames.
+
+        Assigning to this recomputes how the transform is called. Two facts are
+        derived from the object and would otherwise go stale: whether it accepts
+        an ``rng`` keyword, and which layout it declares via ``output_format``.
+        A stale ``rng`` flag is the dangerous one --- the transform would silently
+        fall back to global randomness and quietly stop being reproducible, with
+        nothing in the output to show for it.
+        """
+        return self._transform
+
+    @transform.setter
+    def transform(self, value: Callable | None) -> None:
+        if value is not None and self._output_format == "THWC":
+            raise ValueError(
+                "output_format='THWC' returns the raw decoded clip and cannot be "
+                "combined with a transform. Set output_format='TCHW' or 'CTHW' "
+                "first, or leave the transform as None."
+            )
+        self._transform = value
+        self._transform_takes_rng = _accepts_rng(value)
+        self._transform_layout: str | None = getattr(value, "output_format", None)
+
+    @property
+    def output_format(self) -> str:
+        """Layout of ``pixel_values``: ``"TCHW"``, ``"CTHW"`` or ``"THWC"``.
+
+        Validated on assignment. An unchecked attribute here was silently
+        accepted and then produced normalized floats where the documented raw
+        uint8 clip was expected.
+        """
+        return self._output_format
+
+    @output_format.setter
+    def output_format(self, value: str) -> None:
+        if value not in OUTPUT_FORMATS:
+            raise ValueError(
+                f"output_format must be one of {OUTPUT_FORMATS}, got {value!r}."
+            )
+        if value == "THWC" and self._transform is not None:
+            raise ValueError(
+                "output_format='THWC' returns the raw decoded clip and cannot be "
+                "combined with a transform. Clear the transform first."
+            )
+        self._output_format = value
 
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        original_idx = idx
-        retries = 0
-        while retries < self.max_retries:
-            try:
-                return self._load_item(idx)
-            except Exception as e:
-                retries += 1
-                if retries >= self.max_retries:
-                    logger.error(
-                        "Failed to load video after %d retries. "
-                        "Original index: %d, last tried index: %d. "
-                        "Last error: %s",
-                        self.max_retries,
-                        original_idx,
-                        idx,
-                        e,
-                    )
-                    raise
-                idx = random.randint(0, len(self.dataset) - 1)
+        """Decode segment *idx*.
 
-        raise RuntimeError(
-            f"Failed to load a valid video after {self.max_retries} attempts"
+        Args:
+            idx: Row index into the underlying HuggingFace dataset.
+
+        Returns:
+            A dict with ``pixel_values`` (a tensor, or ``None`` under
+            ``on_error="skip"``), ``label``, ``label_str``, and -- when
+            ``return_meta`` is set -- the passthrough columns ``path``,
+            ``dataset``, ``subject``, ``cam``, ``start`` and ``end``, plus the
+            ``fall-da`` compatibility keys ``start_time``, ``end_time``,
+            ``segment_duration``, ``video_path`` (the *relative* path, same as
+            ``path``) and ``video_file`` (the absolute file on disk).
+
+        Raises:
+            VideoUnavailableError: If the row has no video file, regardless of
+                ``on_error``.
+            VideoDecodeError: Under ``on_error="raise"``, or under
+                ``on_error="retry"`` once the retry budget is exhausted.
+        """
+        requested = idx
+        if idx < 0:
+            idx += len(self)
+        if not 0 <= idx < len(self):
+            raise IndexError(
+                f"Index {requested} is out of range for a dataset with "
+                f"{len(self)} segments."
+            )
+
+        try:
+            return self._load_item(idx)
+        except VideoDecodeError as exc:
+            if self.on_error == "raise":
+                raise
+            if self.on_error == "skip":
+                logger.warning("Skipping segment %d: %s", idx, exc)
+                sample = self._metadata(idx)
+                sample["pixel_values"] = None
+                sample["error"] = str(exc)
+                return sample
+            return self._retry(idx, exc)
+
+    def _retry(self, idx: int, first_error: VideoDecodeError) -> dict[str, Any]:
+        """Substitute random other indices for a failing one (legacy policy)."""
+        rng = np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,)).item()))
+        error: Exception = first_error
+        for attempt in range(1, self.max_retries + 1):
+            substitute = int(rng.integers(0, len(self)))
+            if substitute == idx and len(self) > 1:
+                substitute = (substitute + 1) % len(self)
+            logger.warning(
+                "on_error='retry': segment %d failed (%s); substituting segment "
+                "%d instead (attempt %d/%d). The batch will NOT contain the "
+                "sample that was asked for.",
+                idx,
+                error,
+                substitute,
+                attempt,
+                self.max_retries,
+            )
+            try:
+                return self._load_item(substitute)
+            except (VideoDecodeError, VideoUnavailableError) as exc:
+                error = exc
+        raise VideoDecodeError(
+            str(self.dataset[idx]["video"]),
+            float(self.dataset[idx]["start"]),
+            float(self.dataset[idx]["end"]),
+            f"Failed to load segment {idx} and {self.max_retries} random "
+            f"substitutes; last error: {error}",
         )
 
     def _load_item(self, idx: int) -> dict[str, Any]:
+        """Decode and transform one segment without any error handling."""
         row = self.dataset[idx]
         video_path = row["video"]
 
         if video_path is None:
-            raise FileNotFoundError(
-                f"Video path is None for index {idx} (path={row.get('path')}). "
-                "This segment has no downloadable video."
+            raise VideoUnavailableError(
+                f"No video file for segment {idx} of dataset "
+                f"{row.get('dataset', self.dataset_name)!r} (path={row.get('path')!r}). "
+                "Run `omnifall prepare "
+                f"{row.get('dataset', '<dataset>')}` to download it, or set "
+                "OMNIFALL_ROOT to a directory holding the videos as "
+                "{OMNIFALL_ROOT}/{dataset}/video/{path}.mp4"
             )
 
-        frames = self._load_video(video_path, idx)
+        rng = self._rng(idx)
+        clip = decode_segment(
+            video_path,
+            start=float(row["start"]),
+            end=float(row["end"]),
+            num_frames=self.num_frames,
+            target_fps=self.target_fps,
+            sampling=self.sampling,
+            rng=rng,
+        )
 
-        if self.transform is not None:
-            result = self.transform(frames)
-        else:
-            result = {"frames": np.stack(frames)}
+        sample = self._metadata(idx, row=row)
+        sample["pixel_values"] = self._to_output(clip, rng)
+        return sample
 
-        result["label"] = row["label"]
-        result["start_time"] = row["start"]
-        result["end_time"] = row["end"]
+    def _rng(self, idx: int) -> np.random.Generator:
+        """Build the per-item random generator.
 
-        for col in self._meta_columns:
-            if col not in result:
-                result[col] = row[col]
-
-        return result
-
-    # ------------------------------------------------------------------
-    # Temporal sampling
-    # ------------------------------------------------------------------
-
-    def _get_segment_offset(self, idx: int, fps: float) -> int:
-        """Compute a random start frame within the annotated segment.
-
-        Uses the corrected clip-duration calculation:
-        ``clip_duration_sec = (num_frames - 1) / target_fps``.
+        With ``seed`` set the stream depends only on ``(seed, idx)``, so it is
+        identical across processes, epochs and worker counts. Without a seed it
+        is drawn from torch's global RNG, which ``DataLoader`` seeds per worker
+        -- numpy's global state is deliberately not used, because ``DataLoader``
+        does *not* reseed it per worker.
         """
-        row = self.dataset[idx]
-        start_frame = int(row["start"] * fps)
-        end_frame = int(row["end"] * fps)
-        segment_frames = end_frame - start_frame
+        if self.seed is None:
+            return np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,)).item()))
+        return np.random.default_rng([int(self.seed), int(idx)])
 
-        clip_duration_sec = (self.num_frames - 1) / self.target_fps
-        required_frames = int(clip_duration_sec * fps) + 1
+    def _to_output(self, clip: np.ndarray, rng: np.random.Generator) -> torch.Tensor:
+        """Apply the transform and put the result into :attr:`output_format`."""
+        if self.transform is None:
+            tensor = torch.from_numpy(np.ascontiguousarray(clip))
+            return _convert_layout(tensor, "THWC", self.output_format)
 
-        if segment_frames <= required_frames:
-            return start_frame
+        if self._transform_takes_rng:
+            result = self.transform(clip, rng=rng)
         else:
-            max_offset = segment_frames - required_frames
-            return start_frame + random.randint(0, int(max_offset))
+            result = self.transform(clip)
 
-    # ------------------------------------------------------------------
-    # Video decoding (PyAV)
-    # ------------------------------------------------------------------
+        if isinstance(result, dict):
+            if "pixel_values" not in result:
+                raise ValueError(
+                    "A transform returning a dict must provide 'pixel_values'; "
+                    f"got keys {sorted(result)}."
+                )
+            tensor = result["pixel_values"]
+        else:
+            tensor = result
 
-    def _load_video(
-        self, path: str, idx: int
-    ) -> list[np.ndarray]:
-        if self._use_fast:
-            return self._load_video_fast(path, idx)
-        return self._load_video_slow(path, idx)
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                "The transform must return a torch.Tensor (optionally wrapped in "
+                f"a dict under 'pixel_values'), got {type(tensor).__name__}."
+            )
+        if tensor.ndim != 4:
+            raise ValueError(
+                f"The transform must return a 4D clip tensor, got shape "
+                f"{tuple(tensor.shape)}."
+            )
 
-    def _load_video_fast(
-        self, path: str, idx: int
-    ) -> list[np.ndarray]:
-        """PTS-based seeking for efficient frame extraction."""
+        return _convert_layout(tensor, self._source_layout(tensor), self.output_format)
+
+    def _source_layout(self, tensor: torch.Tensor) -> str:
+        """Determine the layout the transform produced."""
+        if self._transform_layout is not None:
+            return str(self._transform_layout)
+
+        inferred = _infer_layout(tuple(tensor.shape))
+        if inferred is not None:
+            return inferred
+
+        if not self._warned_ambiguous_layout:
+            self._warned_ambiguous_layout = True
+            warnings.warn(
+                f"Cannot tell which layout the transform produced from shape "
+                f"{tuple(tensor.shape)}; assuming it is already "
+                f"{self.output_format!r}. Give the transform an 'output_format' "
+                "attribute to make this explicit.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        return self.output_format
+
+    def _metadata(self, idx: int, row: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build the non-pixel part of a sample.
+
+        The key set is a superset of what ``fall-da``'s ``OmnifallVideoDataset``
+        emits, so that it can be swapped for this class without touching the
+        training loop. Note that ``video_path`` is the **relative** dataset path
+        (``fall-da`` semantics, identical to ``path``); the absolute file on
+        disk is under the separate key ``video_file``.
+
+        Args:
+            idx: Row index.
+            row: The already-fetched row, if the caller has one.
+
+        Returns:
+            The sample dict without ``pixel_values``.
+
+        Raises:
+            KeyError: If the row carries a label id outside ``range(16)``.
+        """
+        if row is None:
+            row = self.dataset[idx]
+
+        label = row["label"]
         try:
-            with av.open(path) as container:
-                vs = next(s for s in container.streams if s.type == "video")
+            label_str = IDX2LABEL[int(label)]
+        except KeyError as exc:
+            raise KeyError(
+                f"Segment {idx} of {self.dataset_name!r} has label id {label}, "
+                f"which is not one of the {len(IDX2LABEL)} OmniFall activity "
+                "labels. The dataset is inconsistent with omnifall.ACTIVITY_LABELS."
+            ) from exc
 
-                rate = vs.average_rate or vs.base_rate
-                if not rate or rate.denominator == 0:
-                    raise ValueError("Cannot determine FPS")
-                fps = float(rate)
+        sample: dict[str, Any] = {"label": label, "label_str": label_str}
+        if not self.return_meta:
+            return sample
 
-                tb = vs.time_base
-                if not tb:
-                    raise ValueError("Missing time_base")
-                tb = float(tb)
-
-                frame_cnt = (
-                    None if vs.frames in (0, None) else int(vs.frames)
-                )
-
-                begin_frame = (
-                    self._get_segment_offset(idx, fps) if frame_cnt else 0
-                )
-
-                desired_timestamps = [
-                    (begin_frame / fps) + n / self.target_fps
-                    for n in range(self.num_frames)
-                ]
-                desired_pts = [int(ts / tb) for ts in desired_timestamps]
-
-                if desired_pts:
-                    try:
-                        container.seek(
-                            desired_pts[0],
-                            any_frame=False,
-                            backward=True,
-                            stream=vs,
-                        )
-                    except av.error.FFmpegError:
-                        container.seek(0, stream=vs)
-
-                frames: list[np.ndarray] = []
-                want_idx = 0
-                prev = None
-                for f in container.decode(vs):
-                    if f.pts is None:
-                        continue
-
-                    while (
-                        want_idx < len(desired_pts)
-                        and f.pts >= desired_pts[want_idx]
-                    ):
-                        if prev and abs(
-                            prev.pts - desired_pts[want_idx]
-                        ) < abs(f.pts - desired_pts[want_idx]):
-                            frames.append(prev.to_ndarray(format="rgb24"))
-                        else:
-                            frames.append(f.to_ndarray(format="rgb24"))
-                        want_idx += 1
-
-                    if want_idx == len(desired_pts):
-                        break
-                    prev = f
-
-                if not frames:
-                    logger.warning("%s: fallback to slow loader", path)
-                    return self._load_video_slow(path, idx)
-
-                # Pad by repeating last frame
-                if len(frames) < self.num_frames:
-                    last = frames[-1]
-                    while len(frames) < self.num_frames:
-                        frames.append(last)
-
-                return frames
-
-        except Exception as e:
-            logger.error("Error reading video %s: %s", path, e, exc_info=True)
-            raise RuntimeError(f"Failed to process video {path}") from e
-
-    def _load_video_slow(
-        self, path: str, idx: int
-    ) -> list[np.ndarray]:
-        """Sequential decode fallback."""
-        try:
-            with av.open(path) as container:
-                vs = next(s for s in container.streams if s.type == "video")
-
-                rate = vs.average_rate
-                if rate and rate.denominator != 0:
-                    fps = float(rate.numerator / rate.denominator)
-                else:
-                    raise ValueError(f"Cannot determine FPS for {path}")
-
-                target_interval = max(1, round(fps / self.target_fps))
-
-                frames: list[np.ndarray] = []
-                for i, frame in enumerate(container.decode(vs)):
-                    if i % target_interval == 0:
-                        frames.append(frame.to_ndarray(format="rgb24"))
-
-            if not frames:
-                raise ValueError(f"No frames decoded from {path}")
-
-            if len(frames) < self.num_frames:
-                last = frames[-1]
-                while len(frames) < self.num_frames:
-                    frames.append(last)
-            else:
-                start_index = self._get_segment_offset(idx, fps)
-                # Convert absolute frame offset to index in the subsampled list
-                start_index_sub = start_index // target_interval
-                start_index_sub = min(
-                    start_index_sub, max(0, len(frames) - self.num_frames)
-                )
-                frames = frames[start_index_sub : start_index_sub + self.num_frames]
-
-            return frames
-
-        except Exception as e:
-            logger.error("Error reading video %s: %s", path, e)
-            raise RuntimeError(f"Failed to process video {path}") from e
-
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
+        for column in self._meta_columns:
+            sample.setdefault(column, row[column])
+        # fall-da / omnifall 0.1.0 key names, kept so existing code keeps working.
+        sample["start_time"] = row["start"]
+        sample["end_time"] = row["end"]
+        sample["segment_duration"] = float(row["end"]) - float(row["start"])
+        sample["video_path"] = row["path"]
+        sample["video_file"] = row["video"]
+        return sample
 
     @property
     def targets(self) -> torch.Tensor:
-        """All class labels as a tensor (for samplers / statistics)."""
-        return torch.tensor(self.dataset["label"])
+        """All class labels as a tensor, for samplers and class statistics."""
+        return torch.tensor(self.dataset["label"], dtype=torch.long)
+
+    def meta(self, idx: int) -> Any:
+        """Container metadata of the video file backing segment *idx*.
+
+        Args:
+            idx: Row index.
+
+        Returns:
+            The :class:`~omnifall._decode.VideoMeta` for the file. Cached per
+            file, so calling this for every segment is cheap.
+
+        Raises:
+            VideoUnavailableError: If the row has no video file.
+        """
+        video_path = self.dataset[idx]["video"]
+        if video_path is None:
+            raise VideoUnavailableError(
+                f"No video file for segment {idx} of {self.dataset_name!r}."
+            )
+        return probe(video_path)
 
     def __repr__(self) -> str:
         return (
             f"OmniFallVideoDataset(name={self.dataset_name!r}, "
-            f"segments={len(self)}, fps={self.target_fps}, "
-            f"num_frames={self.num_frames})"
+            f"segments={len(self)}, num_frames={self.num_frames}, "
+            f"target_fps={self.target_fps}, sampling={self.sampling!r}, "
+            f"output_format={self.output_format!r})"
         )
+
+
+def _accepts_rng(transform: Callable[..., Any] | None) -> bool:
+    """Whether *transform* can be passed an ``rng`` keyword argument.
+
+    Getting this wrong is expensive and silent: a ``False`` here means the
+    seeded per-item generator never reaches the transform, which then falls back
+    to global randomness and quietly stops being reproducible, with nothing in
+    the output to show for it.
+
+    The earlier version special-cased plain functions and otherwise inspected
+    ``type(x).__call__``, which reported ``False`` for
+    :func:`functools.partial`, for bound methods, and for any callable that
+    forwards ``**kwargs``. ``inspect.signature`` already follows all three
+    correctly, so it is asked directly.
+
+    A ``**kwargs`` forwarder is treated as accepting ``rng``: it will not raise
+    on the keyword, and passing a generator that is then ignored is a visible
+    no-op, whereas withholding one silently breaks reproducibility. Between two
+    imperfect guesses, prefer the one that fails loudly.
+    """
+    if transform is None:
+        return False
+    try:
+        signature = inspect.signature(transform)
+    except (TypeError, ValueError):  # pragma: no cover - exotic callables
+        return False
+
+    for name, parameter in signature.parameters.items():
+        if name == "rng" and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY:
+            return True
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
 
 
 class MultiOmniFallDataset(Dataset):
-    """Wrapper for multiple ``OmniFallVideoDataset`` instances.
+    """Concatenate several :class:`OmniFallVideoDataset` instances.
 
-    Enables training on multiple datasets simultaneously with proper
-    cumulative indexing.
+    Items carry a ``domain_id`` (the index of the sub-dataset) and a
+    ``domain_name``, which is what multi-source training in ``fall-da`` uses.
 
     Args:
-        datasets: List of ``OmniFallVideoDataset`` instances.
+        datasets: The datasets to concatenate, in order. Empty sub-datasets are
+            allowed and are simply never indexed.
+
+    Raises:
+        ValueError: If *datasets* is empty.
+
+    Example::
+
+        multi = MultiOmniFallDataset([cmdfall_ds, le2i_ds])
+        multi[0]["domain_name"]
     """
 
     def __init__(self, datasets: list[OmniFallVideoDataset]) -> None:
-        self.datasets = datasets
-        self._sizes = [len(d) for d in datasets]
+        if not datasets:
+            raise ValueError("MultiOmniFallDataset needs at least one dataset.")
+
+        self.datasets = list(datasets)
+        self._sizes = [len(d) for d in self.datasets]
         self._cumulative = np.cumsum(self._sizes)
 
-        total = int(self._cumulative[-1]) if len(self._cumulative) else 0
         logger.info(
             "MultiOmniFallDataset: %d datasets, %d total segments",
-            len(datasets),
-            total,
+            len(self.datasets),
+            len(self),
         )
 
     def __len__(self) -> int:
-        return int(self._cumulative[-1]) if len(self._cumulative) else 0
+        return int(self._cumulative[-1])
+
+    def _locate(self, idx: int) -> tuple[int, int]:
+        """Map a global index to ``(dataset_index, local_index)``.
+
+        ``searchsorted(..., side="right")`` returns the first position whose
+        cumulative count strictly exceeds *idx*, which is the sub-dataset that
+        owns it. Using ``side="right"`` also skips over empty sub-datasets,
+        whose cumulative entries are duplicates of their predecessor's.
+
+        Args:
+            idx: Global index; negative indices count from the end.
+
+        Returns:
+            The sub-dataset index and the index within that sub-dataset.
+
+        Raises:
+            IndexError: If *idx* is out of range.
+        """
+        total = len(self)
+        requested = idx
+        if idx < 0:
+            idx += total
+        if not 0 <= idx < total:
+            raise IndexError(
+                f"Index {requested} is out of range for MultiOmniFallDataset "
+                f"with {total} segments."
+            )
+        ds_idx = int(np.searchsorted(self._cumulative, idx, side="right"))
+        offset = 0 if ds_idx == 0 else int(self._cumulative[ds_idx - 1])
+        return ds_idx, idx - offset
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        ds_idx = bisect.bisect_right(self._cumulative, idx)
-        local_idx = idx if ds_idx == 0 else idx - int(self._cumulative[ds_idx - 1])
-
+        ds_idx, local_idx = self._locate(idx)
         sample = self.datasets[ds_idx][local_idx]
         sample["domain_id"] = ds_idx
         sample["domain_name"] = self.datasets[ds_idx].dataset_name
@@ -353,37 +658,40 @@ class MultiOmniFallDataset(Dataset):
 
     @property
     def targets(self) -> torch.Tensor:
-        """All class labels across all datasets."""
+        """All class labels across all sub-datasets, concatenated in order."""
         return torch.cat([d.targets for d in self.datasets])
 
     @property
     def domain_ids(self) -> torch.Tensor:
-        """Domain ID for each segment (dataset index)."""
+        """The sub-dataset index of every segment, in order."""
         ids: list[int] = []
-        for i, d in enumerate(self.datasets):
-            ids.extend([i] * len(d))
-        return torch.tensor(ids)
+        for i, dataset in enumerate(self.datasets):
+            ids.extend([i] * len(dataset))
+        return torch.tensor(ids, dtype=torch.long)
 
     @property
     def dataset_names(self) -> list[str]:
+        """The name of each sub-dataset, in order."""
         return [d.dataset_name for d in self.datasets]
 
     def get_dataset_statistics(self) -> dict[str, dict[str, Any]]:
-        """Per-dataset segment counts and class distributions."""
+        """Per-sub-dataset segment counts and class distributions.
+
+        Returns:
+            Mapping from dataset name to ``{"total_segments", "class_distribution"}``.
+        """
         stats: dict[str, dict[str, Any]] = {}
-        for d in self.datasets:
-            targets = d.targets
-            unique, counts = torch.unique(targets, return_counts=True)
-            stats[d.dataset_name] = {
-                "total_segments": len(d),
-                "class_distribution": {
-                    int(c): int(n) for c, n in zip(unique, counts)
-                },
+        for dataset in self.datasets:
+            unique, counts = torch.unique(dataset.targets, return_counts=True)
+            stats[dataset.dataset_name] = {
+                "total_segments": len(dataset),
+                "class_distribution": {int(c): int(n) for c, n in zip(unique, counts)},
             }
         return stats
 
     def __repr__(self) -> str:
-        parts = ", ".join(
-            f"{d.dataset_name}({len(d)})" for d in self.datasets
+        parts = ", ".join(f"{d.dataset_name}({len(d)})" for d in self.datasets)
+        return (
+            f"MultiOmniFallDataset({len(self.datasets)} datasets: {parts}, "
+            f"total={len(self)})"
         )
-        return f"MultiOmniFallDataset({len(self.datasets)} datasets: {parts}, total={len(self)})"
