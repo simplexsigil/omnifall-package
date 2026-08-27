@@ -62,9 +62,7 @@ all = [
 
 [project.urls]
 Homepage = "https://huggingface.co/datasets/simplexsigil2/omnifall"
-# Repository = "https://github.com/<owner>/<repo>"  # set once the code repo exists.
-# Note: github.com/simplexsigil/omnifall is the project *website*
-# (index.html + static/), not a code repository.
+Repository = "https://github.com/simplexsigil/omnifall-package"  
 Paper = "https://arxiv.org/abs/2505.19889"
 "Project Page" = "https://simplexsigil.github.io/omnifall/"
 
